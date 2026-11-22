@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lexia · Camminata</title>
+<style>
+:root{color-scheme:light;font:16px system-ui,-apple-system,sans-serif;background:#f6f2f8;color:#23172b;--size:170px}
+@media(max-width:600px){:root{--size:128px}}
+body{margin:0;min-height:100vh;background:#f6f2f8}
+main{margin:clamp(2rem,10vh,7rem) auto 0;width:min(84%,48rem);padding-bottom:calc(var(--size) + 90px)}
+h1{font-size:clamp(3rem,9vw,7rem);line-height:1;margin:0;letter-spacing:-.07em}
+p{line-height:1.6;color:#514257}
+button{font:inherit;border:0;border-radius:999px;padding:.72rem 1rem;background:#43234c;color:#fff;cursor:pointer}
+.lexia-track{position:fixed;left:0;right:0;bottom:calc(10px + env(safe-area-inset-bottom));height:calc(var(--size) + 70px);pointer-events:none;overflow:hidden;z-index:50}
+.lexia-track canvas{position:absolute;left:0;bottom:0;width:100%;height:100%}
+.lexia-bubble{position:absolute;bottom:0;left:0;width:max-content;padding:.45rem .75rem;border-radius:.8rem;background:#fff;color:#43234c;box-shadow:0 3px 14px #43234c30;font-size:.88rem;font-weight:600;opacity:0;transform:translate(-50%,6px);transition:opacity .25s,transform .25s;white-space:nowrap}
+.lexia-bubble.show{opacity:1;transform:translate(-50%,0)}
+.lexia-bubble::after{content:"";position:absolute;top:100%;left:calc(50% - 6px + var(--arrow,0px));border:6px solid transparent;border-top-color:#fff}
+</style>
+</head>
+<body>
+<main>
+<h1>Lexia</h1>
+<p>Simulazione della camminata lungo il bordo inferiore della pagina: rig 2D con cinematica inversa, piedi vincolati al pavimento e rollio tallone → pianta → punta.</p>
+<button type="button" id="toggle">Pausa</button>
+</main>
+<div class="lexia-track" aria-hidden="true"><canvas></canvas><div class="lexia-bubble">Se hai bisogno, dimmi!</div></div>
+<script>
+const RIG = /*RIG*/null;
+(() => {
+const track = document.querySelector('.lexia-track');
+const canvas = track.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const bubble = track.querySelector('.lexia-bubble');
+const toggle = document.getElementById('toggle');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)');
+const D = Math.PI / 180;
+
+// ---------- rig geometry (source pixels of the side drawing) ----------
+const L1 = 119.0, L2 = 118.7;               // thigh, shin
+const U1 = 90.6, U2 = 53.5;                 // upper arm, forearm
+const BONE0 = {thigh: 73.4*D, shin: 69.3*D, upperArm: 112.0*D, foreArm: 110.8*D};
+const BOOT0 = 24.9*D;                       // boot drawn rotated this much when sole is flat
+const ANK_H = 28;                           // ankle height over flat sole
+const HEEL = [-21, ANK_H], BALL = [27, ANK_H], TOE = [55, ANK_H];
+const SHOULDER = [-30, -110];               // shoulder from hip
+const STAND_H = 494;                        // head-to-sole when standing
+const S = 280;                              // stride (one full cycle) in rig units
+const CYCLE = 1.12;                         // seconds per cycle at full speed
+const V = S / CYCLE;
+const DUTY = 0.62, HEEL_END = 0.12, FLAT_END = 0.42;
+const C = 0.30 * S;                         // flat-foot ankle x (cycle frame)
+const HS_PITCH = 16*D, TO_PITCH = -38*D;
+const LMAX = 0.997 * (L1 + L2);
+
+const rot = (v, a) => [v[0]*Math.cos(a) - v[1]*Math.sin(a), v[0]*Math.sin(a) + v[1]*Math.cos(a)];
+const smooth = t => t*t*(3 - 2*t);
+const minJerk = t => t*t*t*(10 - 15*t + 6*t*t);
+const clamp01 = t => Math.max(0, Math.min(1, t));
+// pitch > 0 = toe up. Screen y grows downward, ground at y = 0.
+function footAnkle(pivotWorld, pivotLocal, pitch){ const r = rot(pivotLocal, -pitch); return [pivotWorld[0]-r[0], pivotWorld[1]-r[1]]; }
+function stance(p){
+  if (p < HEEL_END){ const a = HS_PITCH*(1 - smooth(p/HEEL_END)); return {ank: footAnkle([C+HEEL[0],0], HEEL, a), pitch: a}; }
+  if (p < FLAT_END) return {ank: [C, -ANK_H], pitch: 0};
+  const t = (p - FLAT_END)/(DUTY - FLAT_END), a = TO_PITCH*t*t;
+  return {ank: footAnkle([C+BALL[0],0], BALL, a), pitch: a};
+}
+const TOE_OFF = stance(DUTY - 1e-6);
+const STRIKE = (() => { const s = stance(0); return {ank: [s.ank[0]+S, s.ank[1]], pitch: s.pitch}; })();
+// foot pose in the cycle frame where the hip is at x = p*S
+function foot(p){
+  if (p < DUTY) return stance(p);
+  const s = (p - DUTY)/(1 - DUTY), m = minJerk(s);
+  const x = TOE_OFF.ank[0] + (STRIKE.ank[0]-TOE_OFF.ank[0])*m;
+  let y = TOE_OFF.ank[1] + (STRIKE.ank[1]-TOE_OFF.ank[1])*m - 20*Math.sin(Math.PI*Math.pow(s,0.75));
+  const pitch = TO_PITCH + (STRIKE.pitch-TO_PITCH)*minJerk(clamp01(s*1.15));
+  const mg = -3*Math.sin(Math.PI*s);
+  for (const pt of [HEEL, BALL, TOE]){ const w = rot(pt, -pitch); if (y + w[1] > mg) y = mg - w[1]; }
+  return {ank: [x, y], pitch};
+}
+function legRel(p){ const f = foot(p); return {dx: f.ank[0] - p*S, y: f.ank[1], pitch: f.pitch}; }
+
+// hip height table over one cycle (keeps both legs within reach -> natural bob)
+const N = 240, HT = new Float32Array(N);
+for (let i = 0; i < N; i++){
+  const ph = i/N; let h = Infinity;
+  for (const p of [ph, (ph+0.5)%1]){ if (p > DUTY + 0.02) continue; const l = legRel(p); h = Math.min(h, -l.y + Math.sqrt(Math.max(0, LMAX*LMAX - l.dx*l.dx))); }
+  HT[i] = h;
+}
+const HS = new Float32Array(N);
+for (let i = 0; i < N; i++){ let a = 0, w = 0; for (let k = -10; k <= 10; k++){ const g = Math.exp(-k*k/30); a += g*HT[(i+k+N)%N]; w += g; } HS[i] = Math.min(a/w, HT[i]); }
+const hipH = ph => { const f = ph*N, i = Math.floor(f), t = f - i; return HS[i%N]*(1-t) + HS[(i+1)%N]*t; };
+
+function ik(hip, ank){
+  let dx = ank[0]-hip[0], dy = ank[1]-hip[1], d = Math.hypot(dx, dy);
+  d = Math.min(d, L1+L2-0.01);
+  const al = Math.atan2(dy, dx);
+  const b = Math.acos(Math.max(-1, Math.min(1, (L1*L1 + d*d - L2*L2)/(2*L1*d))));
+  const ta = al - b;                       // knee points forward (+x)
+  const knee = [hip[0] + L1*Math.cos(ta), hip[1] + L1*Math.sin(ta)];
+  return {ta, sa: Math.atan2(ank[1]-knee[1], ank[0]-knee[0]), knee};
+}
+
+// ---------- images ----------
+const img = {}, dark = {};
+let pending = 0;
+function load(name){
+  pending++;
+  const im = new Image();
+  im.onload = () => {
+    img[name] = im;
+    if (name !== 'front' && name !== 'body'){
+      const c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+      const x = c.getContext('2d'); x.drawImage(im, 0, 0);
+      x.globalCompositeOperation = 'source-atop'; x.fillStyle = 'rgba(20,6,24,.30)'; x.fillRect(0, 0, c.width, c.height);
+      dark[name] = c;
+    }
+    if (--pending === 0) start();
+  };
+  im.src = RIG[name].src;
+}
+function part(set, name, at, ang){
+  const r = RIG[name];
+  ctx.save(); ctx.translate(at[0], at[1]); ctx.rotate(ang);
+  ctx.drawImage(set[name], -r.px, -r.py); ctx.restore();
+}
+
+// ---------- pose drawing (rig units, ground y = 0, hip x = 0) ----------
+function drawSide(phase){
+  const h = hipH(phase);
+  const hip = [0, -h];
+  const pN = phase % 1, pF = (phase + 0.5) % 1;
+  const lean = -1.5*D + 0.8*D*Math.sin(4*Math.PI*phase);
+  const leg = (p, set, off) => {
+    const l = legRel(p), hp = [hip[0]+off[0], hip[1]+off[1]];
+    const ank = [l.dx, l.y], k = ik(hp, ank);
+    part(set, 'boot', ank, BOOT0 - l.pitch);
+    part(set, 'thigh', hp, k.ta - BONE0.thigh);
+    part(set, 'shin', k.knee, k.sa - BONE0.shin);
+  };
+  const arm = (p, set, off) => {
+    const sw = Math.cos(2*Math.PI*(p - 0.08));             // +1 back, -1 forward
+    const ua = 90*D + 20*D*sw;
+    const fwd = (1 - sw)/2;
+    const fa = ua - (6*D + 22*D*fwd);
+    const sh0 = rot(SHOULDER, lean);
+    const sh = [hip[0]+sh0[0]+off[0], hip[1]+sh0[1]+off[1]];
+    const el = [sh[0] + U1*Math.cos(ua), sh[1] + U1*Math.sin(ua)];
+    part(set, 'upperArm', sh, ua - BONE0.upperArm);
+    part(set, 'foreArm', el, fa - BONE0.foreArm);
+  };
+  arm(pF, dark, [16, 2]);
+  leg(pF, dark, [-5, -2]);
+  leg(pN, img, [0, 0]);
+  part(img, 'body', hip, lean);
+  arm(pN, img, [0, 0]);
+  return h;
+}
+function drawFront(){
+  const f = RIG.front, h = STAND_H, w = f.w*h/f.h;
+  ctx.drawImage(img.front, -w/2 + 8, -h, w, h);
+}
+
+// ---------- timeline ----------
+let W = 0, Hc = 0, dpr = 1, K = 0.34;
+function resize(){
+  dpr = Math.min(3, window.devicePixelRatio || 1);
+  W = track.clientWidth; Hc = track.clientHeight;
+  canvas.width = Math.round(W*dpr); canvas.height = Math.round(Hc*dpr);
+  const size = parseFloat(getComputedStyle(track).height) - 70;
+  K = size / STAND_H;
+}
+const T_TURN = 0.45, T_HOLD = 3.0, T_OFF = 1.6;
+let plan;
+function makePlan(){
+  const enter = -150/K, exit = W/K + 150/K;
+  const target = (W - Math.max(90, 0.5*STAND_H*K) - 20) / K;
+  const stopS = S*(Math.round(target/S - 0.08) + 0.08);
+  const dDec = 0.55*S;
+  const tWalk1 = (stopS - dDec - enter)/V, tDec = 2*dDec/V;
+  const tAcc = tDec, tWalk2 = (exit - stopS - dDec)/V;
+  const ts = [tWalk1, tDec, T_TURN, T_HOLD, T_TURN, tAcc, tWalk2, T_OFF];
+  return {enter, exit, stopS, dDec, ts, total: ts.reduce((a,b)=>a+b, 0)};
+}
+// returns {s, mode, mix}  mode: 'side' | 'turn' (mix 0 side -> 1 front) | 'front' | 'off'
+function stateAt(t){
+  const P = plan, [a,b,c,d,e,f,g] = P.ts;
+  t %= P.total;
+  if (t < a) return {s: P.enter + V*t, mix: 0};
+  t -= a; if (t < b){ const u = t/b; return {s: P.stopS - P.dDec + P.dDec*(2*u - u*u), mix: 0}; }
+  t -= b; if (t < c) return {s: P.stopS, mix: smooth(t/c)};
+  t -= c; if (t < d) return {s: P.stopS, mix: 1, bubble: true};
+  t -= d; if (t < e) return {s: P.stopS, mix: 1 - smooth(t/e)};
+  t -= e; if (t < f){ const u = t/f; return {s: P.stopS + P.dDec*u*u, mix: 0}; }
+  t -= f; if (t < g) return {s: P.stopS + P.dDec + V*t, mix: 0};
+  return {s: P.exit, mix: 0, off: true};
+}
+function render(st){
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (st.off){ bubble.classList.remove('show'); return; }
+  const x = st.s*K, base = Hc - 4;
+  const draw = (fn, alpha, sx) => {
+    if (alpha <= 0.001) return;
+    ctx.setTransform(dpr*K*sx, 0, 0, dpr*K, x*dpr, base*dpr);
+    ctx.globalAlpha = alpha; fn(); ctx.globalAlpha = 1;
+  };
+  const m = st.mix;
+  // short turn: side squashes out while the front pose widens in
+  if (m < 1) draw(() => drawSide(st.s / S), m < 0.5 ? 1 : 1 - (m-0.5)*2, 1 - 0.45*m);
+  if (m > 0) draw(drawFront, m > 0.5 ? 1 : m*2, 0.55 + 0.45*m);
+  const bw = bubble.offsetWidth, cx = x + 4;
+  const bx = Math.max(bw/2 + 8, Math.min(W - bw/2 - 8, cx));
+  bubble.style.left = bx + 'px';
+  bubble.style.setProperty('--arrow', Math.max(-bw/2 + 14, Math.min(bw/2 - 14, cx - bx)) + 'px');
+  bubble.style.bottom = (STAND_H*K + 14) + 'px';
+  bubble.classList.toggle('show', !!st.bubble);
+}
+
+let running = true, t = 0, prev, raf;
+function frame(now){
+  if (prev !== undefined) t += Math.min(0.05, (now - prev)/1000);
+  prev = now; render(stateAt(t));
+  if (running) raf = requestAnimationFrame(frame);
+}
+function staticPose(){
+  const P = plan; render({s: Math.min(P.stopS, W/K - 120/K), mix: 1, bubble: true});
+}
+function start(){
+  resize(); plan = makePlan();
+  addEventListener('resize', () => { resize(); plan = makePlan(); if (!running || reduce.matches) staticPose(); });
+  reduce.addEventListener?.('change', () => { location.reload(); });
+  if (reduce.matches){ running = false; staticPose(); toggle.hidden = true; return; }
+  raf = requestAnimationFrame(frame);
+  toggle.addEventListener('click', () => {
+    running = !running; prev = undefined; toggle.textContent = running ? 'Pausa' : 'Avvia';
+    cancelAnimationFrame(raf); if (running) raf = requestAnimationFrame(frame);
+  });
+}
+// hooks for offline preview rendering
+window.__lexia = {seek(sec){ running = false; cancelAnimationFrame(raf); t = sec; render(stateAt(t)); }, get plan(){ return plan; }, drawSide, stateAt, hipH, legRel, ik};
+for (const n of Object.keys(RIG)) load(n);
+})();
+</script>
+</body>
+</html>
