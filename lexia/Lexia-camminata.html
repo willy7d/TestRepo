@@ -171,18 +171,19 @@ function pose(phase, w, farStand){
     const a = [far.dx, far.y]; liftClear(a, far.pitch, 0); far.y = a[1];
   }
   const g = 1 - w;
-  const lean = 2.0*D*g + 0.7*D*g*Math.cos(4*Math.PI*(phase - 0.05));
+  const lean = /*LEAN*/7.5*D*g + 0.7*D*g*Math.cos(4*Math.PI*(phase - 0.05));   // forward trunk lean while walking
+  const fwd = /*FWD*/9*g;                                      // trunk carried ahead of the hips while walking
   const twist = 3*g;                                         // pelvis / shoulder counter-rotation seen from the side
   const arm = p => {                                         // near arm is furthest back at its own heel strike
     const c = Math.cos(2*Math.PI*(p - 0.04));
     const sh = lerp(-2, -6 - 17*c, g), el = lerp(8, 30 - 14*Math.cos(2*Math.PI*(p - 0.10)), g);
     return {ua: (90 - sh)*D, fa: (90 - sh - el)*D, off: -1.3*twist*Math.cos(2*Math.PI*p)};
   };
-  return {h, lean, near, far, hipN: twist*Math.cos(2*Math.PI*pN), hipF: twist*Math.cos(2*Math.PI*pF), armN: arm(pN), armF: arm(pF)};
+  return {h, lean, fwd, near, far, hipN: twist*Math.cos(2*Math.PI*pN), hipF: twist*Math.cos(2*Math.PI*pF), armN: arm(pN), armF: arm(pF)};
 }
 function drawSide(phase, w = 0, farStand = STAND_FAR){
   const P = pose(phase, w, farStand), hip = [0, -P.h];
-  const bodyAt = [hip[0] + BODY_OFF[0], hip[1] + BODY_OFF[1]];
+  const bodyAt = [hip[0] + BODY_OFF[0] + P.fwd, hip[1] + BODY_OFF[1]];
   const leg = (l, set, off) => {
     const hp = [hip[0]+off[0], hip[1]+off[1]], ank = [l.dx, l.y], k = ik(hp, ank);
     part(set, 'boot', ank, -l.pitch);
