@@ -210,32 +210,66 @@ function drawFront(){
   ctx.drawImage(img.front, -w/2 + /*FX*/-6, -h, w, h);
 }
 
-// offscreen snapshots of the two standing views, redrawn in vertical slices on a rotating cylinder
-const BX0 = 112, BTOP = 14, R_CYL = 92, SLICE = 3;
-const bufs = [document.createElement('canvas'), document.createElement('canvas')];
-function snapshot(i, fn){
-  const q = dpr*K, b = bufs[i], w = Math.ceil(2*BX0*q), h = Math.ceil((STAND_H + BTOP + 8)*q);
-  if (b.width !== w || b.height !== h){ b.width = w; b.height = h; }
-  const main = ctx; ctx = b.getContext('2d');
-  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0, 0, w, h);
-  ctx.setTransform(q, 0, 0, q, BX0*q, (STAND_H + BTOP)*q); fn(); ctx = main;
-}
-const warpBuf = document.createElement('canvas');
-function wrapped(i, turn, alpha){
-  if (alpha <= 0.001) return;
-  const q = dpr*K, b = bufs[i], HP = Math.PI/2;
-  const f = x => R_CYL*Math.sin(Math.max(-HP, Math.min(HP, turn(Math.asin(Math.max(-1, Math.min(1, x/R_CYL)))))));
-  const c0 = f(0);                                           // keep the body axis in place: she turns on the spot
-  // warp at full opacity into a buffer first, so slice seams never show through when fading
-  if (warpBuf.width !== b.width || warpBuf.height !== b.height){ warpBuf.width = b.width; warpBuf.height = b.height; }
-  const w2 = warpBuf.getContext('2d'); w2.clearRect(0, 0, b.width, b.height);
-  for (let x = -BX0; x < BX0; x += SLICE){
-    const a = f(x), w = f(x + SLICE) - a;
-    if (w > 0.02) w2.drawImage(b, (x + BX0)*q, 0, SLICE*q, b.height, (a - c0 + BX0)*q, 0, w*q + 0.6, b.height);
+// ---------- turn towards the viewer ----------
+// Only two drawings exist (profile and front). In-between views are synthesised once at start-up: at every height
+// the body is treated as an ellipse whose depth comes from the profile silhouette and whose width comes from the
+// front silhouette; the ellipse is rotated and each visible surface point is textured from the drawing that sees it.
+const BX0 = 112, BTOP = 14, QS = 0.8, NF = 16;
+let turnFrames = null;
+function buildTurn(){
+  const w = Math.ceil(2*BX0*QS), h = Math.ceil((STAND_H + BTOP + 8)*QS);
+  const grab = fn => {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const main = ctx; ctx = c.getContext('2d');
+    ctx.setTransform(QS, 0, 0, QS, BX0*QS, (STAND_H + BTOP)*QS); fn(); ctx = main;
+    return c.getContext('2d').getImageData(0, 0, w, h).data;
+  };
+  const A = grab(() => drawSide(P_STOP, 1, STAND_FAR)), B = grab(drawFront);
+  const ext = px => { const lo = new Float32Array(h), hi = new Float32Array(h);
+    for (let y = 0; y < h; y++){ let a = -1, b = -1; for (let x = 0; x < w; x++) if (px[(y*w + x)*4 + 3] > 128){ if (a < 0) a = x; b = x; } lo[y] = a; hi[y] = b + 1; }
+    // smooth the outline along y so stretched regions do not tear row by row
+    const sl = new Float32Array(h), sh = new Float32Array(h);
+    for (let y = 0; y < h; y++){ let a = 0, b = 0, n = 0; for (let k = -2; k <= 2; k++){ const j = y + k; if (j >= 0 && j < h && lo[j] >= 0){ a += lo[j]; b += hi[j]; n++; } }
+      if (lo[y] < 0 || !n){ sl[y] = -1; sh[y] = 0; } else { sl[y] = a/n; sh[y] = b/n; } }
+    return {lo: sl, hi: sh}; };
+  const ea = ext(A), eb = ext(B);
+  const half = e => { const r = new Float32Array(h);
+    for (let y = 0; y < h; y++){ let sum = 0, n = 0; for (let k = -3; k <= 3; k++){ const j = y + k; if (j >= 0 && j < h && e.lo[j] >= 0){ sum += (e.hi[j] - e.lo[j])/2; n++; } } r[y] = n ? sum/n : 0; }
+    return r; };
+  const sa = half(ea), sb = half(eb);
+  const sample = (px, y, x, out) => {                         // premultiplied, linear in x
+    const x0 = Math.max(0, Math.min(w - 2, Math.floor(x))), f = Math.max(0, Math.min(1, x - x0)), i = (y*w + x0)*4;
+    const a0 = px[i+3]*(1-f), a1 = px[i+7]*f;
+    out[0] = px[i]*a0 + px[i+4]*a1; out[1] = px[i+1]*a0 + px[i+5]*a1; out[2] = px[i+2]*a0 + px[i+6]*a1; out[3] = a0 + a1;
+  };
+  const frames = [], p = [0,0,0,0], q = [0,0,0,0], HP = Math.PI/2;
+  for (let k = 1; k <= NF; k++){
+    const u = k/(NF + 1), th = HP*u, c = Math.cos(th), sn = Math.sin(th), g = smooth(clamp01((u - 0.24)/0.16));     // hand over early: a narrowed front face reads as three-quarter, a widened profile does not
+    const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    const cx2 = cv.getContext('2d'), im = cx2.createImageData(w, h), o = im.data;
+    for (let y = 0; y < h; y++){
+      if (ea.lo[y] < 0 || eb.lo[y] < 0) continue;
+      const ca = (ea.lo[y] + ea.hi[y])/2, ha = Math.max(0, (ea.hi[y] - ea.lo[y])/2 - 1.6), cb = (eb.lo[y] + eb.hi[y])/2, hb = Math.max(0, (eb.hi[y] - eb.lo[y])/2 - 3.4);   // stay off the antialiased fringe
+      const rho = Math.hypot(sa[y]*c, sb[y]*sn), del = Math.atan2(sb[y]*sn, sa[y]*c), cen = lerp(ca, cb, u);
+      if (rho < 0.5) continue;
+      for (let x = Math.max(0, Math.ceil(cen - rho)); x <= Math.min(w - 1, Math.floor(cen + rho)); x++){
+        const t = Math.acos(Math.max(-1, Math.min(1, (x - cen)/rho))) - del;      // surface parameter, in (-del, pi-del)
+        const edge = Math.min(1, (rho - Math.abs(x - cen)) + 0.5);
+        let wf = t <= 0 ? 1 : t >= HP ? 0 : g;
+        sample(A, y, ca + ha*Math.cos(Math.max(0, t)) - 0.5, p);
+        sample(B, y, cb - hb*Math.sin(Math.min(HP, t)) - 0.5, q);
+        // a drawing that is empty here (e.g. the gap between the legs seen from the front) hands over to the other one
+        // (fading out as the front view takes over, so the gap opens gradually instead of popping)
+        let fade = 1;
+        if (q[3] < 128 && p[3] > q[3]){ wf = 0; fade = 1 - g; } else if (p[3] < 128 && q[3] > p[3]){ wf = 1; fade = g; }
+        const al = p[3]*(1 - wf) + q[3]*wf, i = (y*w + x)*4;
+        if (al < 1) continue;
+        o[i] = (p[0]*(1 - wf) + q[0]*wf)/al; o[i+1] = (p[1]*(1 - wf) + q[1]*wf)/al; o[i+2] = (p[2]*(1 - wf) + q[2]*wf)/al; o[i+3] = al*edge*fade;
+      }
+    }
+    cx2.putImageData(im, 0, 0); frames.push(cv);
   }
-  ctx.globalAlpha = alpha;
-  ctx.drawImage(warpBuf, -BX0, -(STAND_H + BTOP), b.width/q, b.height/q);
-  ctx.globalAlpha = 1;
+  turnFrames = frames;
 }
 
 // ---------- timeline ----------
@@ -247,7 +281,7 @@ function resize(){
   const size = parseFloat(getComputedStyle(track).height) - 70;
   K = size / STAND_H;
 }
-const T_SETTLE = 0.25, T_TURN = 0.6, T_HOLD = 3.0, T_OFF = 1.6;
+const T_SETTLE = 0.2, T_TURN = 0.7, T_HOLD = 3.0, T_OFF = 1.6;
 let plan;
 function makePlan(){
   const enter = -150/K, exit = W/K + 150/K;
@@ -272,9 +306,9 @@ function stateAt(t){
   if (t < a) return {s: P.enter + V*t, w: 0, mix: 0};
   t -= a; if (t < b){ const u = t/b, s = P.stopS - P.dDec*(1-u)*(1-u); return {s, w: standW(s, false), mix: 0}; }
   t -= b; if (t < c) return {s: P.stopS, w: 1, mix: 0};
-  t -= c; if (t < d) return {s: P.stopS, w: 1, mix: smooth(t/d)};
+  t -= c; if (t < d) return {s: P.stopS, w: 1, mix: t/d};
   t -= d; if (t < e) return {s: P.stopS, w: 1, mix: 1, bubble: true};
-  t -= e; if (t < f) return {s: P.stopS, w: 1, mix: 1 - smooth(t/f)};
+  t -= e; if (t < f) return {s: P.stopS, w: 1, mix: 1 - t/f};
   t -= f; if (t < g) return {s: P.stopS, w: 1, mix: 0};
   t -= g; if (t < h){ const u = t/h, s = P.stopS + P.dAcc*u*u; return {s, w: standW(s, true), mix: 0}; }
   t -= h; if (t < i) return {s: P.stopS + P.dAcc + V*t, w: 0, mix: 0};
@@ -290,16 +324,10 @@ function render(st){
     ctx.globalAlpha = alpha; fn(); ctx.globalAlpha = 1;
   };
   const m = st.mix;
-  // turn towards the viewer: both views are wrapped on a cylinder that rotates by 90° (volume, not a flat card)
-  if (m <= 0) draw(() => drawSide(st.s/S, st.w, plan.stopS + STAND_FAR - st.s), 1, 1);
-  else if (m >= 1) draw(drawFront, 1, 1);
-  else {
-    const th = 90*D*m, deg = th/D;
-    snapshot(0, () => drawSide(st.s/S, 1, STAND_FAR)); snapshot(1, drawFront);
-    ctx.setTransform(dpr*K, 0, 0, dpr*K, x*dpr, base*dpr);
-    wrapped(0, phi => phi - th, deg < 45 ? 1 : clamp01((53 - deg)/8));
-    wrapped(1, phi => phi + Math.PI/2 - th, clamp01((deg - 37)/8));
-  }
+  const k = turnFrames ? Math.round(m*(NF + 1)) : (m < 0.5 ? 0 : NF + 1);
+  if (k <= 0) draw(() => drawSide(st.s/S, st.w, plan.stopS + STAND_FAR - st.s), 1, 1);
+  else if (k > NF) draw(drawFront, 1, 1);
+  else draw(() => { const f = turnFrames[k - 1]; ctx.drawImage(f, -BX0, -(STAND_H + BTOP), f.width/QS, f.height/QS); }, 1, 1);
   const bw = bubble.offsetWidth, cx = x - 4*K;
   const bx = Math.max(bw/2 + 8, Math.min(W - bw/2 - 8, cx));
   bubble.style.left = bx + 'px';
@@ -322,6 +350,7 @@ function start(){
   addEventListener('resize', () => { resize(); plan = makePlan(); if (!running || reduce.matches) staticPose(); });
   reduce.addEventListener?.('change', () => { location.reload(); });
   if (reduce.matches){ running = false; staticPose(); toggle.hidden = true; return; }
+  buildTurn();
   raf = requestAnimationFrame(frame);
   toggle.addEventListener('click', () => {
     running = !running; prev = undefined; toggle.textContent = running ? 'Pausa' : 'Avvia';
