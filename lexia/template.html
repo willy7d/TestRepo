@@ -31,7 +31,7 @@ const RIG = /*RIG*/null;
 (() => {
 const track = document.querySelector('.lexia-track');
 const canvas = track.querySelector('canvas');
-const ctx = canvas.getContext('2d');
+let ctx = canvas.getContext('2d');
 const bubble = track.querySelector('.lexia-bubble');
 const toggle = document.getElementById('toggle');
 const reduce = matchMedia('(prefers-reduced-motion: reduce)');
@@ -210,6 +210,34 @@ function drawFront(){
   ctx.drawImage(img.front, -w/2 + /*FX*/-6, -h, w, h);
 }
 
+// offscreen snapshots of the two standing views, redrawn in vertical slices on a rotating cylinder
+const BX0 = 112, BTOP = 14, R_CYL = 92, SLICE = 3;
+const bufs = [document.createElement('canvas'), document.createElement('canvas')];
+function snapshot(i, fn){
+  const q = dpr*K, b = bufs[i], w = Math.ceil(2*BX0*q), h = Math.ceil((STAND_H + BTOP + 8)*q);
+  if (b.width !== w || b.height !== h){ b.width = w; b.height = h; }
+  const main = ctx; ctx = b.getContext('2d');
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0, 0, w, h);
+  ctx.setTransform(q, 0, 0, q, BX0*q, (STAND_H + BTOP)*q); fn(); ctx = main;
+}
+const warpBuf = document.createElement('canvas');
+function wrapped(i, turn, alpha){
+  if (alpha <= 0.001) return;
+  const q = dpr*K, b = bufs[i], HP = Math.PI/2;
+  const f = x => R_CYL*Math.sin(Math.max(-HP, Math.min(HP, turn(Math.asin(Math.max(-1, Math.min(1, x/R_CYL)))))));
+  const c0 = f(0);                                           // keep the body axis in place: she turns on the spot
+  // warp at full opacity into a buffer first, so slice seams never show through when fading
+  if (warpBuf.width !== b.width || warpBuf.height !== b.height){ warpBuf.width = b.width; warpBuf.height = b.height; }
+  const w2 = warpBuf.getContext('2d'); w2.clearRect(0, 0, b.width, b.height);
+  for (let x = -BX0; x < BX0; x += SLICE){
+    const a = f(x), w = f(x + SLICE) - a;
+    if (w > 0.02) w2.drawImage(b, (x + BX0)*q, 0, SLICE*q, b.height, (a - c0 + BX0)*q, 0, w*q + 0.6, b.height);
+  }
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(warpBuf, -BX0, -(STAND_H + BTOP), b.width/q, b.height/q);
+  ctx.globalAlpha = 1;
+}
+
 // ---------- timeline ----------
 let W = 0, Hc = 0, dpr = 1, K = 0.34;
 function resize(){
@@ -219,7 +247,7 @@ function resize(){
   const size = parseFloat(getComputedStyle(track).height) - 70;
   K = size / STAND_H;
 }
-const T_SETTLE = 0.25, T_TURN = 0.5, T_HOLD = 3.0, T_OFF = 1.6;
+const T_SETTLE = 0.25, T_TURN = 0.6, T_HOLD = 3.0, T_OFF = 1.6;
 let plan;
 function makePlan(){
   const enter = -150/K, exit = W/K + 150/K;
@@ -262,9 +290,16 @@ function render(st){
     ctx.globalAlpha = alpha; fn(); ctx.globalAlpha = 1;
   };
   const m = st.mix;
-  // turn towards the viewer, like a card turning: the standing side view narrows, then the front view widens (no ghosting)
-  if (m < 0.5) draw(() => drawSide(st.s/S, st.w, plan.stopS + STAND_FAR - st.s), 1, lerp(1, 0.55, smooth(m*2)));
-  else draw(drawFront, 1, lerp(0.45, 1, smooth(m*2 - 1)));
+  // turn towards the viewer: both views are wrapped on a cylinder that rotates by 90° (volume, not a flat card)
+  if (m <= 0) draw(() => drawSide(st.s/S, st.w, plan.stopS + STAND_FAR - st.s), 1, 1);
+  else if (m >= 1) draw(drawFront, 1, 1);
+  else {
+    const th = 90*D*m, deg = th/D;
+    snapshot(0, () => drawSide(st.s/S, 1, STAND_FAR)); snapshot(1, drawFront);
+    ctx.setTransform(dpr*K, 0, 0, dpr*K, x*dpr, base*dpr);
+    wrapped(0, phi => phi - th, deg < 45 ? 1 : clamp01((53 - deg)/8));
+    wrapped(1, phi => phi + Math.PI/2 - th, clamp01((deg - 37)/8));
+  }
   const bw = bubble.offsetWidth, cx = x - 4*K;
   const bx = Math.max(bw/2 + 8, Math.min(W - bw/2 - 8, cx));
   bubble.style.left = bx + 'px';

@@ -39,6 +39,8 @@ Cosa è cambiato:
 - **Ritagli** (`tools/cut2.py`, `tools/legpoly.py`): coscia, tibia e stivale rifatti dalla gamba d'appoggio della posa 4 (dritta e tutta visibile), bordi netti, calotta tonda al ginocchio → niente più ginocchio gonfio. Busto e braccia restano quelli della v1.
 - Anteprime rigenerate: `preview/Lexia-anteprima.mp4` (H.264, 1280×480, 30 fps, 14 s), `preview/big.png` (8 fasi), `preview/sheet.png` (fotogrammi del video).
 
-Limiti rimasti: il giro verso chi guarda non è una vera rotazione (manca una posa di tre quarti); bordo del braccio vicino ancora un po' frastagliato; ginocchio della gamba arretrata che si flette un po' prima della curva normativa (50–55 % del ciclo); verificato su Chromium (desktop, emulazione iPhone 13, reduced-motion), non su Safari reale.
+- Giro verso chi guarda (dopo «quando si gira è piatta»): non più figura schiacciata; le due viste ferme sono avvolte su un cilindro che ruota di 90° con asse del corpo fermo e scambio rapido a metà (`snapshot` / `wrapped` in `template.html`, fotogrammi in `preview/giro.png`).
+
+Limiti rimasti: il giro resta un passaggio tra due soli disegni (profilo e fronte): per una rotazione vera serve una posa di tre quarti disegnata; bordo del braccio vicino ancora un po' frastagliato; ginocchio della gamba arretrata che si flette un po' prima della curva normativa (50–55 % del ciclo); verificato su Chromium (desktop, emulazione iPhone 13, reduced-motion), non su Safari reale.
 
 Strumenti v2 (da una cartella di lavoro con `src/p4.png` = cella 4 dello sprite, `parts/`, `template.html`, `rig.json`): `cut2.py` → parti gamba + `rig.json`; `build.py [out.html] [S=… C=…]`; `dbg.js` angoli per fase contro le curve; `fit.js` ricerca S/C; `seq.js` foglio di fotogrammi della sequenza; `rec.js` fotogrammi per l'MP4 (`ffmpeg -framerate 30 -i frames/f%04d.png -vf scale=1280:-2 -c:v libx264 -pix_fmt yuv420p -movflags +faststart`).
