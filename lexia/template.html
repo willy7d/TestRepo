@@ -22,7 +22,7 @@ button{font:inherit;border:0;border-radius:999px;padding:.72rem 1rem;background:
 <body>
 <main>
 <h1>Lexia</h1>
-<p>Simulazione della camminata lungo il bordo inferiore della pagina: rig 2D con cinematica inversa, piedi vincolati al pavimento e rollio tallone → pianta → punta.</p>
+<p>Simulazione della camminata lungo il bordo inferiore della pagina: rig 2D guidato da curve di camminata normative (anca, ginocchio, caviglia), piedi vincolati al pavimento e rollio tallone → pianta → punta.</p>
 <button type="button" id="toggle">Pausa</button>
 </main>
 <div class="lexia-track" aria-hidden="true"><canvas></canvas><div class="lexia-bubble">Se hai bisogno, dimmi!</div></div>
@@ -38,59 +38,85 @@ const reduce = matchMedia('(prefers-reduced-motion: reduce)');
 const D = Math.PI / 180;
 
 // ---------- rig geometry (source pixels of the side drawing) ----------
-const L1 = 119.0, L2 = 118.7;               // thigh, shin
+const L1 = 110.5, L2 = 114.9;               // thigh, shin
 const U1 = 90.6, U2 = 53.5;                 // upper arm, forearm
-const BONE0 = {thigh: 73.4*D, shin: 69.3*D, upperArm: 112.0*D, foreArm: 110.8*D};
-const BOOT0 = 24.9*D;                       // boot drawn rotated this much when sole is flat
-const ANK_H = 28;                           // ankle height over flat sole
-const HEEL = [-21, ANK_H], BALL = [27, ANK_H], TOE = [55, ANK_H];
-const SHOULDER = [-30, -110];               // shoulder from hip
-const STAND_H = 494;                        // head-to-sole when standing
-const S = 280;                              // stride (one full cycle) in rig units
-const CYCLE = 1.12;                         // seconds per cycle at full speed
+const BONE0 = {thigh: 80.62*D, shin: 97.0*D, upperArm: 112.0*D, foreArm: 110.8*D};
+const ANK_H = 33.5;                         // ankle height over flat sole
+const HEELX = -17, BALLX = 37, TOEX = 53;   // sole contact points (x from ankle)
+const SOLE = [[-19, ANK_H], [BALLX, ANK_H], [56, ANK_H - 1.5]];
+const SHOULDER = [-30, -110];               // shoulder from body pivot
+const BODY_OFF = [/*BX*/11, /*BY*/0];        // body pivot relative to hip joint
+const HEAD_H = 229;                         // head top above hip
+
+// ---------- normative sagittal gait curves, every 5 % of the cycle (0 % = heel strike) ----------
+// thigh angle to vertical, knee flexion, ankle dorsiflexion (deg) – adult level walking, natural cadence
+// (shape and timing after Winter 1991 / Perry 1992)
+const TH = [22, 21, 18, 13, 8, 3, -2, -7, -12, -16, -19, -17, -10, 0, 10, 18, 23, 25, 25, 23];
+const KN = [5, 12, 18, 20, 18, 14, 10, 7, 5, 7, 13, 25, 40, 55, 63, 62, 52, 36, 18, 6];
+const AN = [0, -5, -4, 0, 3, 5, 7, 8, 10, 10, 7, -5, -17, -19, -12, -5, 0, 2, 2, 1];
+function curve(tb, p){                      // periodic Catmull-Rom
+  const n = tb.length, f = (((p % 1) + 1) % 1)*n, i = Math.floor(f), t = f - i;
+  const a = tb[(i+n-1)%n], b = tb[i%n], c = tb[(i+1)%n], d = tb[(i+2)%n];
+  return 0.5*(2*b + (c-a)*t + (2*a-5*b+4*c-d)*t*t + (3*b-a-3*c+d)*t*t*t);
+}
+const S = /*S*/385;                         // stride (one full cycle) in rig units
+const CYCLE = 1.15;                         // seconds per cycle at full speed
 const V = S / CYCLE;
-const DUTY = 0.62, HEEL_END = 0.12, FLAT_END = 0.42;
-const C = 0.30 * S;                         // flat-foot ankle x (cycle frame)
-const HS_PITCH = 16*D, TO_PITCH = -38*D;
-const LMAX = 0.997 * (L1 + L2);
+const FF = 0.10, HO = 0.36, TO = 0.62;      // foot flat, heel off, toe off (fractions of cycle)
+const C = /*C*/86;                          // flat-foot ankle x (cycle frame, hip at p*S)
+const G_HS = 17*D, G_TO = -58*D;            // foot-to-floor angle at heel strike / toe off
+const KMIN = 4*D;                           // never fully lock the knee (avoids IK snapping)
+const reach = k => Math.sqrt(L1*L1 + L2*L2 + 2*L1*L2*Math.cos(k));
+const DMAX = reach(KMIN);
 
 const rot = (v, a) => [v[0]*Math.cos(a) - v[1]*Math.sin(a), v[0]*Math.sin(a) + v[1]*Math.cos(a)];
 const smooth = t => t*t*(3 - 2*t);
-const minJerk = t => t*t*t*(10 - 15*t + 6*t*t);
 const clamp01 = t => Math.max(0, Math.min(1, t));
+const lerp = (a, b, t) => a + (b - a)*t;
 // pitch > 0 = toe up. Screen y grows downward, ground at y = 0.
-function footAnkle(pivotWorld, pivotLocal, pitch){ const r = rot(pivotLocal, -pitch); return [pivotWorld[0]-r[0], pivotWorld[1]-r[1]]; }
+// stance foot rolls over the ground without slipping: heel rocker, flat, forefoot rocker
+function contactFoot(xc, pitch){ const r = rot([xc, ANK_H], -pitch); return {ank: [C + xc - r[0], -r[1]], pitch}; }
 function stance(p){
-  if (p < HEEL_END){ const a = HS_PITCH*(1 - smooth(p/HEEL_END)); return {ank: footAnkle([C+HEEL[0],0], HEEL, a), pitch: a}; }
-  if (p < FLAT_END) return {ank: [C, -ANK_H], pitch: 0};
-  const t = (p - FLAT_END)/(DUTY - FLAT_END), a = TO_PITCH*t*t;
-  return {ank: footAnkle([C+BALL[0],0], BALL, a), pitch: a};
+  if (p < FF) return contactFoot(HEELX, G_HS*Math.pow(1 - p/FF, 1.6));
+  if (p < HO) return {ank: [C, -ANK_H], pitch: 0};
+  const pitch = G_TO*Math.pow((p - HO)/(TO - HO), 1.5);
+  return contactFoot(lerp(BALLX, TOEX, smooth(clamp01(-pitch/(35*D)))), pitch);
 }
-const TOE_OFF = stance(DUTY - 1e-6);
-const STRIKE = (() => { const s = stance(0); return {ank: [s.ank[0]+S, s.ank[1]], pitch: s.pitch}; })();
+// pelvis height over the cycle: chosen so that the stance knee follows the normative curve
+const N = 240, HT = new Float32Array(N), CAP = new Float32Array(N), HS = new Float32Array(N);
+for (let i = 0; i < N; i++){
+  const ph = i/N; let num = 0, den = 0, cap = Infinity;
+  for (const p of [ph, (ph + 0.5) % 1]){
+    if (p >= TO) continue;
+    const st = stance(p), dx = st.ank[0] - S*p, d = reach(Math.max(KMIN, curve(KN, p)*D));
+    const w = Math.pow(Math.sin(Math.PI*p/TO), 2) + 1e-3;
+    num += w*(-st.ank[1] + Math.sqrt(Math.max(1, d*d - dx*dx))); den += w;
+    cap = Math.min(cap, -st.ank[1] + Math.sqrt(Math.max(1, DMAX*DMAX - dx*dx)));
+  }
+  CAP[i] = cap; HT[i] = Math.min(num/den, cap);
+}
+for (let i = 0; i < N; i++){ let a = 0, w = 0; for (let k = -12; k <= 12; k++){ const g = Math.exp(-k*k/32); a += g*HT[(i+k+N)%N]; w += g; } HS[i] = Math.min(a/w, CAP[i]); }
+const hipH = ph => { const f = (((ph % 1) + 1) % 1)*N, i = Math.floor(f), t = f - i; return HS[i%N]*(1-t) + HS[(i+1)%N]*t; };
+// swing: forward kinematics of the normative angles from the hip, blended onto the toe-off / heel-strike contacts
+function fk(p){
+  const th = curve(TH, p)*D, sh = th - curve(KN, p)*D;
+  return {ank: [S*p + L1*Math.sin(th) + L2*Math.sin(sh), -hipH(p) + L1*Math.cos(th) + L2*Math.cos(sh)], pitch: sh + curve(AN, p)*D};
+}
+const ST_TO = stance(TO - 1e-6), ST_HS = stance(0), FK_TO = fk(TO), FK_HS = fk(1 - 1e-6);
+const D0 = [ST_TO.ank[0] - FK_TO.ank[0], ST_TO.ank[1] - FK_TO.ank[1], ST_TO.pitch - FK_TO.pitch];
+const D1 = [ST_HS.ank[0] + S - FK_HS.ank[0], ST_HS.ank[1] - FK_HS.ank[1], ST_HS.pitch - FK_HS.pitch];
+function liftClear(ank, pitch, margin){
+  for (const pt of SOLE){ const w = rot(pt, -pitch); if (ank[1] + w[1] > -margin) ank[1] = -margin - w[1]; }
+}
 // foot pose in the cycle frame where the hip is at x = p*S
 function foot(p){
-  if (p < DUTY) return stance(p);
-  const s = (p - DUTY)/(1 - DUTY), m = minJerk(s);
-  const x = TOE_OFF.ank[0] + (STRIKE.ank[0]-TOE_OFF.ank[0])*m;
-  let y = TOE_OFF.ank[1] + (STRIKE.ank[1]-TOE_OFF.ank[1])*m - 20*Math.sin(Math.PI*Math.pow(s,0.75));
-  const pitch = TO_PITCH + (STRIKE.pitch-TO_PITCH)*minJerk(clamp01(s*1.15));
-  const mg = -3*Math.sin(Math.PI*s);
-  for (const pt of [HEEL, BALL, TOE]){ const w = rot(pt, -pitch); if (y + w[1] > mg) y = mg - w[1]; }
-  return {ank: [x, y], pitch};
+  if (p < TO) return stance(p);
+  const f = fk(p), s = (p - TO)/(1 - TO), m = smooth(s);
+  const ank = [f.ank[0] + lerp(D0[0], D1[0], m), f.ank[1] + lerp(D0[1], D1[1], m)], pitch = f.pitch + lerp(D0[2], D1[2], m);
+  liftClear(ank, pitch, 3*Math.sin(Math.PI*s));
+  return {ank, pitch};
 }
-function legRel(p){ const f = foot(p); return {dx: f.ank[0] - p*S, y: f.ank[1], pitch: f.pitch}; }
-
-// hip height table over one cycle (keeps both legs within reach -> natural bob)
-const N = 240, HT = new Float32Array(N);
-for (let i = 0; i < N; i++){
-  const ph = i/N; let h = Infinity;
-  for (const p of [ph, (ph+0.5)%1]){ if (p > DUTY + 0.02) continue; const l = legRel(p); h = Math.min(h, -l.y + Math.sqrt(Math.max(0, LMAX*LMAX - l.dx*l.dx))); }
-  HT[i] = h;
-}
-const HS = new Float32Array(N);
-for (let i = 0; i < N; i++){ let a = 0, w = 0; for (let k = -10; k <= 10; k++){ const g = Math.exp(-k*k/30); a += g*HT[(i+k+N)%N]; w += g; } HS[i] = Math.min(a/w, HT[i]); }
-const hipH = ph => { const f = ph*N, i = Math.floor(f), t = f - i; return HS[i%N]*(1-t) + HS[(i+1)%N]*t; };
+function legRel(p){ p = ((p % 1) + 1) % 1; const f = foot(p); return {dx: f.ank[0] - p*S, y: f.ank[1], pitch: f.pitch}; }
 
 function ik(hip, ank){
   let dx = ank[0]-hip[0], dy = ank[1]-hip[1], d = Math.hypot(dx, dy);
@@ -101,6 +127,13 @@ function ik(hip, ank){
   const knee = [hip[0] + L1*Math.cos(ta), hip[1] + L1*Math.sin(ta)];
   return {ta, sa: Math.atan2(ank[1]-knee[1], ank[0]-knee[0]), knee};
 }
+
+// standing pose (feet together) used for the stop: the near foot is already flat on the ground at phase P_STOP
+const STAND_NEAR = -10, STAND_FAR = 4;      // ankle x relative to hip
+const P_STOP = (C - STAND_NEAR)/S;          // phase at which the near foot sits under the hip
+const P_CLOSE = FF + 0.02;                  // far foot toes off here -> closing step
+const H_STAND = ANK_H + Math.sqrt(reach(5*D)**2 - STAND_NEAR*STAND_NEAR);
+const STAND_H = H_STAND + HEAD_H;           // head-to-sole when standing
 
 // ---------- images ----------
 const img = {}, dark = {};
@@ -126,40 +159,54 @@ function part(set, name, at, ang){
   ctx.drawImage(set[name], -r.px, -r.py); ctx.restore();
 }
 
-// ---------- pose drawing (rig units, ground y = 0, hip x = 0) ----------
-function drawSide(phase){
-  const h = hipH(phase);
-  const hip = [0, -h];
-  const pN = phase % 1, pF = (phase + 0.5) % 1;
-  const lean = -1.5*D + 0.8*D*Math.sin(4*Math.PI*phase);
-  const leg = (p, set, off) => {
-    const l = legRel(p), hp = [hip[0]+off[0], hip[1]+off[1]];
-    const ank = [l.dx, l.y], k = ik(hp, ank);
-    part(set, 'boot', ank, BOOT0 - l.pitch);
-    part(set, 'thigh', hp, k.ta - BONE0.thigh);
+// ---------- pose (rig units, ground y = 0, hip x = 0) ----------
+// phase: gait phase of the near leg; w: 0 = walking … 1 = standing; farStand: x of the far foot's standing spot
+function pose(phase, w, farStand){
+  const pN = ((phase % 1) + 1) % 1, pF = (pN + 0.5) % 1;
+  const h = lerp(hipH(phase), H_STAND, w);
+  const near = legRel(pN), far = legRel(pF);
+  if (w > 0){
+    const air = Math.sin(Math.PI*w);
+    far.dx = lerp(far.dx, farStand, w); far.y = lerp(far.y, -ANK_H, w) - 7*air; far.pitch = lerp(far.pitch, 0, w) - 8*D*air;
+    const a = [far.dx, far.y]; liftClear(a, far.pitch, 0); far.y = a[1];
+  }
+  const g = 1 - w;
+  const lean = 2.0*D*g + 0.7*D*g*Math.cos(4*Math.PI*(phase - 0.05));
+  const twist = 3*g;                                         // pelvis / shoulder counter-rotation seen from the side
+  const arm = p => {                                         // near arm is furthest back at its own heel strike
+    const c = Math.cos(2*Math.PI*(p - 0.04));
+    const sh = lerp(-2, -6 - 17*c, g), el = lerp(8, 30 - 14*Math.cos(2*Math.PI*(p - 0.10)), g);
+    return {ua: (90 - sh)*D, fa: (90 - sh - el)*D, off: -1.3*twist*Math.cos(2*Math.PI*p)};
+  };
+  return {h, lean, near, far, hipN: twist*Math.cos(2*Math.PI*pN), hipF: twist*Math.cos(2*Math.PI*pF), armN: arm(pN), armF: arm(pF)};
+}
+function drawSide(phase, w = 0, farStand = STAND_FAR){
+  const P = pose(phase, w, farStand), hip = [0, -P.h];
+  const bodyAt = [hip[0] + BODY_OFF[0], hip[1] + BODY_OFF[1]];
+  const leg = (l, set, off) => {
+    const hp = [hip[0]+off[0], hip[1]+off[1]], ank = [l.dx, l.y], k = ik(hp, ank);
+    part(set, 'boot', ank, -l.pitch);
     part(set, 'shin', k.knee, k.sa - BONE0.shin);
+    part(set, 'thigh', hp, k.ta - BONE0.thigh);
+    return k;
   };
-  const arm = (p, set, off) => {
-    const sw = Math.cos(2*Math.PI*(p - 0.08));             // +1 back, -1 forward
-    const ua = 90*D + 20*D*sw;
-    const fwd = (1 - sw)/2;
-    const fa = ua - (6*D + 22*D*fwd);
-    const sh0 = rot(SHOULDER, lean);
-    const sh = [hip[0]+sh0[0]+off[0], hip[1]+sh0[1]+off[1]];
-    const el = [sh[0] + U1*Math.cos(ua), sh[1] + U1*Math.sin(ua)];
-    part(set, 'upperArm', sh, ua - BONE0.upperArm);
-    part(set, 'foreArm', el, fa - BONE0.foreArm);
+  const arm = (a, set, off) => {
+    const sh0 = rot(SHOULDER, P.lean);
+    const sh = [bodyAt[0]+sh0[0]+off[0]+a.off, bodyAt[1]+sh0[1]+off[1]];
+    const el = [sh[0] + U1*Math.cos(a.ua), sh[1] + U1*Math.sin(a.ua)];
+    part(set, 'upperArm', sh, a.ua - BONE0.upperArm);
+    part(set, 'foreArm', el, a.fa - BONE0.foreArm);
   };
-  arm(pF, dark, [16, 2]);
-  leg(pF, dark, [-5, -2]);
-  leg(pN, img, [0, 0]);
-  part(img, 'body', hip, lean);
-  arm(pN, img, [0, 0]);
-  return h;
+  arm(P.armF, dark, [14, 2]);
+  const kF = leg(P.far, dark, [P.hipF - 4, -2]);
+  const kN = leg(P.near, img, [P.hipN, 0]);
+  part(img, 'body', bodyAt, P.lean);
+  arm(P.armN, img, [0, 0]);
+  return {P, kN, kF};
 }
 function drawFront(){
   const f = RIG.front, h = STAND_H, w = f.w*h/f.h;
-  ctx.drawImage(img.front, -w/2 + 8, -h, w, h);
+  ctx.drawImage(img.front, -w/2 + /*FX*/-6, -h, w, h);
 }
 
 // ---------- timeline ----------
@@ -171,29 +218,37 @@ function resize(){
   const size = parseFloat(getComputedStyle(track).height) - 70;
   K = size / STAND_H;
 }
-const T_TURN = 0.45, T_HOLD = 3.0, T_OFF = 1.6;
+const T_SETTLE = 0.25, T_TURN = 0.5, T_HOLD = 3.0, T_OFF = 1.6;
 let plan;
 function makePlan(){
   const enter = -150/K, exit = W/K + 150/K;
-  const target = (W - Math.max(90, 0.5*STAND_H*K) - 20) / K;
-  const stopS = S*(Math.round(target/S - 0.08) + 0.08);
-  const dDec = 0.55*S;
+  const target = (W - Math.max(70, 0.36*STAND_H*K) - 16) / K;
+  const stopS = S*(Math.round(target/S - P_STOP) + P_STOP);
+  const dDec = 0.5*S, dAcc = 0.4*S;
   const tWalk1 = (stopS - dDec - enter)/V, tDec = 2*dDec/V;
-  const tAcc = tDec, tWalk2 = (exit - stopS - dDec)/V;
-  const ts = [tWalk1, tDec, T_TURN, T_HOLD, T_TURN, tAcc, tWalk2, T_OFF];
-  return {enter, exit, stopS, dDec, ts, total: ts.reduce((a,b)=>a+b, 0)};
+  const tAcc = 2*dAcc/V, tWalk2 = (exit - stopS - dAcc)/V;
+  const ts = [tWalk1, tDec, T_SETTLE, T_TURN, T_HOLD, T_TURN, T_SETTLE, tAcc, tWalk2, T_OFF];
+  return {enter, exit, stopS, dDec, dAcc, ts, total: ts.reduce((a,b)=>a+b, 0)};
 }
-// returns {s, mode, mix}  mode: 'side' | 'turn' (mix 0 side -> 1 front) | 'front' | 'off'
+// stand-blend from the gait phase: closing step when stopping, first step when leaving
+function standW(s, leaving){
+  const p = (s - plan.stopS)/S + P_STOP;                     // near-leg phase, continuous around the stop
+  if (!leaving) return clamp01((p - P_CLOSE)/(P_STOP - P_CLOSE));
+  return 1 - smooth(clamp01((p - P_STOP - 0.02)/0.2));
+}
+// returns {s, w, mix}: s = hip x (rig units), w = stand blend, mix 0 side -> 1 front
 function stateAt(t){
-  const P = plan, [a,b,c,d,e,f,g] = P.ts;
-  t %= P.total;
-  if (t < a) return {s: P.enter + V*t, mix: 0};
-  t -= a; if (t < b){ const u = t/b; return {s: P.stopS - P.dDec + P.dDec*(2*u - u*u), mix: 0}; }
-  t -= b; if (t < c) return {s: P.stopS, mix: smooth(t/c)};
-  t -= c; if (t < d) return {s: P.stopS, mix: 1, bubble: true};
-  t -= d; if (t < e) return {s: P.stopS, mix: 1 - smooth(t/e)};
-  t -= e; if (t < f){ const u = t/f; return {s: P.stopS + P.dDec*u*u, mix: 0}; }
-  t -= f; if (t < g) return {s: P.stopS + P.dDec + V*t, mix: 0};
+  const P = plan, [a,b,c,d,e,f,g,h,i] = P.ts;
+  t = ((t % P.total) + P.total) % P.total;
+  if (t < a) return {s: P.enter + V*t, w: 0, mix: 0};
+  t -= a; if (t < b){ const u = t/b, s = P.stopS - P.dDec*(1-u)*(1-u); return {s, w: standW(s, false), mix: 0}; }
+  t -= b; if (t < c) return {s: P.stopS, w: 1, mix: 0};
+  t -= c; if (t < d) return {s: P.stopS, w: 1, mix: smooth(t/d)};
+  t -= d; if (t < e) return {s: P.stopS, w: 1, mix: 1, bubble: true};
+  t -= e; if (t < f) return {s: P.stopS, w: 1, mix: 1 - smooth(t/f)};
+  t -= f; if (t < g) return {s: P.stopS, w: 1, mix: 0};
+  t -= g; if (t < h){ const u = t/h, s = P.stopS + P.dAcc*u*u; return {s, w: standW(s, true), mix: 0}; }
+  t -= h; if (t < i) return {s: P.stopS + P.dAcc + V*t, w: 0, mix: 0};
   return {s: P.exit, mix: 0, off: true};
 }
 function render(st){
@@ -206,10 +261,10 @@ function render(st){
     ctx.globalAlpha = alpha; fn(); ctx.globalAlpha = 1;
   };
   const m = st.mix;
-  // short turn: side squashes out while the front pose widens in
-  if (m < 1) draw(() => drawSide(st.s / S), m < 0.5 ? 1 : 1 - (m-0.5)*2, 1 - 0.45*m);
-  if (m > 0) draw(drawFront, m > 0.5 ? 1 : m*2, 0.55 + 0.45*m);
-  const bw = bubble.offsetWidth, cx = x + 4;
+  // turn towards the viewer, like a card turning: the standing side view narrows, then the front view widens (no ghosting)
+  if (m < 0.5) draw(() => drawSide(st.s/S, st.w, plan.stopS + STAND_FAR - st.s), 1, lerp(1, 0.55, smooth(m*2)));
+  else draw(drawFront, 1, lerp(0.45, 1, smooth(m*2 - 1)));
+  const bw = bubble.offsetWidth, cx = x - 4*K;
   const bx = Math.max(bw/2 + 8, Math.min(W - bw/2 - 8, cx));
   bubble.style.left = bx + 'px';
   bubble.style.setProperty('--arrow', Math.max(-bw/2 + 14, Math.min(bw/2 - 14, cx - bx)) + 'px');
@@ -224,7 +279,7 @@ function frame(now){
   if (running) raf = requestAnimationFrame(frame);
 }
 function staticPose(){
-  const P = plan; render({s: Math.min(P.stopS, W/K - 120/K), mix: 1, bubble: true});
+  const P = plan; render({s: Math.min(P.stopS, W/K - 120/K), w: 1, mix: 1, bubble: true});
 }
 function start(){
   resize(); plan = makePlan();
@@ -238,7 +293,7 @@ function start(){
   });
 }
 // hooks for offline preview rendering
-window.__lexia = {seek(sec){ running = false; cancelAnimationFrame(raf); t = sec; render(stateAt(t)); }, get plan(){ return plan; }, drawSide, stateAt, hipH, legRel, ik};
+window.__lexia = {seek(sec){ running = false; cancelAnimationFrame(raf); t = sec; render(stateAt(t)); }, get plan(){ return plan; }, drawSide, stateAt, hipH, legRel, ik, pose, curve, TH, KN, AN, S, C, D0, D1, P_STOP, H_STAND, L1, L2};
 for (const n of Object.keys(RIG)) load(n);
 })();
 </script>
